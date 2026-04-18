@@ -1,134 +1,191 @@
+/**
+ * Database Configuration Module
+ * 
+ * Provides a production-grade Sequelize instance for MySQL with connection pooling,
+ * environment-based logging, SSL support, and graceful shutdown handling.
+ */
+
+// Load environment variables early
+require('dotenv').config();
+
 const { Sequelize } = require('sequelize');
 const Joi = require('joi');
 const fs = require('fs');
+const path = require('path');
 const logger = require('../utils/logger.util');
 
-// Define validation schema for environment variables using joi
+/**
+ * Environment Variable Validation Schema
+ * Ensures all required database credentials and configurations are present before startup.
+ */
 const envSchema = Joi.object({
-  NODE_ENV: Joi.string().valid('development', 'staging', 'production').default('development'),
-  DB_HOST: Joi.string().required(),
-  DB_PORT: Joi.number().default(3306),
-  DB_NAME: Joi.string().required(),
-  DB_USER: Joi.string().required(),
-  DB_PASSWORD: Joi.string().allow(''), // Allowing empty password exclusively for local/dev use
+  NODE_ENV: Joi.string()
+    .valid('development', 'staging', 'production')
+    .default('development'),
+  DB_HOST: Joi.string().required().description('MySQL Database Hostname'),
+  DB_PORT: Joi.number().default(3306).description('MySQL Port (Default 3306)'),
+  DB_NAME: Joi.string().required().description('Database Name'),
+  DB_USER: Joi.string().required().description('Database User'),
+  DB_PASSWORD: Joi.string().allow('').required().description('Database Password'),
   SSL_CERT_PATH: Joi.string().when('NODE_ENV', {
     is: 'production',
     then: Joi.required(),
     otherwise: Joi.optional()
-  })
-}).unknown().required();
+  }).description('Path to SSL Certificate (Required in Production)')
+}).unknown();
 
-// Validate the incoming process.env keys before trying to boot DB
+// Validate process.env against the schema
 const { error, value: envVars } = envSchema.validate(process.env);
+
 if (error) {
-  // Gracefully crash if DB configuration is missing or malformed
-  logger.error(`Database Config Validation Error: ${error.message}`);
-  process.exit(1); 
+  logger.error(`❌ Configuration validation error: ${error.message}`);
+  // Exit process if configuration is invalid to prevent unpredictable behavior
+  process.exit(1);
 }
 
-// Destructure the perfectly typed and validated environment variables
-const { DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD, NODE_ENV, SSL_CERT_PATH } = envVars;
+const {
+  DB_HOST,
+  DB_PORT,
+  DB_NAME,
+  DB_USER,
+  DB_PASSWORD,
+  NODE_ENV,
+  SSL_CERT_PATH
+} = envVars;
 
-// Prepare robust database dialing configurations
+/**
+ * Global dialect options for the MySQL connection.
+ */
 const dialectOptions = {
-  multipleStatements: false, // Prevents SQL Injection (does not allow stacking semi-colon separated statements)
-  charset: 'utf8mb4',        // Ensures emojis and full unicode character sets are supported
-  timezone: 'local'          // Utilizes the target system's local time (or can be set to +00:00 for UTC focus)
+  // Disabling multiple statements to mitigate risk of certain SQL injection vectors
+  multipleStatements: false, 
+  // Standardizing on utf8mb4 for full emoji and international character support
+  charset: 'utf8mb4',
+  // Use the database's local time (or set to UTC '+00:00' for global consistency)
+  timezone: 'local' 
 };
 
-// Utilize secure SSL connections rigidly if in production
-if (NODE_ENV === 'production' && SSL_CERT_PATH) {
+/**
+ * SSL Configuration for Production
+ * Production environments should always use encrypted connections.
+ */
+if (NODE_ENV === 'production') {
   try {
-    dialectOptions.ssl = {
-      ca: fs.readFileSync(SSL_CERT_PATH) // Load security cert securely on start
-    };
+    // Ensure the certificate file exists before attempting to read
+    const certPath = path.resolve(SSL_CERT_PATH);
+    if (fs.existsSync(certPath)) {
+      dialectOptions.ssl = {
+        ca: fs.readFileSync(certPath)
+      };
+      logger.info('🔒 SSL Certificate loaded for production DB connection.');
+    } else {
+      throw new Error(`SSL certificate not found at path: ${certPath}`);
+    }
   } catch (err) {
-    logger.error(`Failed to load SSL cert at ${SSL_CERT_PATH}: ${err.message}`);
+    logger.error(`❌ SSL Certificate Error: ${err.message}`);
     process.exit(1);
   }
 }
 
-// Intantiate Sequelize targeting MySQL
+/**
+ * Initialize Sequelize Instance
+ * Configures connection pooling and logging behavior based on environment.
+ */
 const sequelize = new Sequelize(DB_NAME, DB_USER, DB_PASSWORD, {
   host: DB_HOST,
   port: DB_PORT,
   dialect: 'mysql',
-  
-  // Enable query logging explicitly tailored for development workflows using the winston logger
-  logging: NODE_ENV === 'development' ? (msg) => logger.info(msg) : false,
-  
-  // Connection Pool bounds configuration
+  // Connection Pooling helps manage multiple simultaneous database requests efficiently
   pool: {
-    max: 10,         // Ceiling for simultaneous open connections 
-    min: 2,          // Minimum maintained threads to reduce latency footprint on burst
-    acquire: 30000,  // Drop acquiring logic forcefully after 30 sec stall 
-    idle: 10000      // Recycle connections silently unread past 10 seconds timeout
+    max: 10,         // Maximum number of connections in pool
+    min: 2,          // Minimum number of connections in pool
+    acquire: 30000,  // The maximum time (ms) that pool will try to get connection before throwing error
+    idle: 10000      // The maximum time (ms) that a connection can be idle before being released
   },
-  
-  dialectOptions
+  // Custom query logging: enabled only in development to keep logs clean in prod
+  logging: NODE_ENV === 'development' 
+    ? (sql) => logger.debug(`Executing SQL: ${sql}`) 
+    : false,
+  dialectOptions,
+  // Ensure the database uses the same collation as our charset
+  define: {
+    charset: 'utf8mb4',
+    collate: 'utf8mb4_unicode_ci',
+    timestamps: true
+  }
 });
 
 /**
- * Pings the database independently to test connection state.
- * @returns {Promise<void>} 
+ * Ping the database to verify connectivity.
+ * Useful for health checks or startup validation.
  */
 const testConnection = async () => {
   try {
     await sequelize.authenticate();
-    logger.info('✅ Database connection has been established successfully.');
-  } catch (error) {
-    logger.error(`❌ Unable to connect to the database: ${error.message}`);
-    throw error;
+    logger.info('✅ MySQL connection established and authenticated successfully.');
+    return true;
+  } catch (err) {
+    logger.error('❌ Database authentication failed:', {
+      message: err.message,
+      host: DB_HOST,
+      database: DB_NAME
+    });
+    throw err;
   }
 };
 
 /**
- * Iteratively attempts to connect DB on crash/fail utilizing Exponential Backoff algorithms
+ * Retry Logic with Exponential Backoff
+ * Attempts to connect to the database multiple times before failing.
+ * 
+ * @param {number} maxRetries - Maximum number of attempts
  */
-const connectWithRetry = async () => {
-  const MAX_RETRIES = 5;
-  let retries = 0;
-  
-  while (retries < MAX_RETRIES) {
+const connectWithRetry = async (maxRetries = 5) => {
+  let attempt = 1;
+
+  while (attempt <= maxRetries) {
     try {
-       // Pinging standard configuration target
       await testConnection();
-      return; 
+      return;
     } catch (err) {
-      retries++;
-      if (retries >= MAX_RETRIES) {
-        logger.error(`❌ Database connection failed after ${MAX_RETRIES} successive retries. Shutting process.`);
+      if (attempt === maxRetries) {
+        logger.error(`🛑 Could not connect to database after ${maxRetries} attempts. Exiting...`);
         process.exit(1);
       }
+
+      // Exponential backoff: 2s, 4s, 8s, 16s...
+      const delay = Math.pow(2, attempt) * 1000;
+      logger.warn(`⚠️ Connection attempt ${attempt} failed. Retrying in ${delay / 1000}s...`);
       
-      // Calculate delay formula base (e.g. 2s => 4s => 8s => 16s ..)
-      const backoffDelay = Math.pow(2, retries) * 1000; 
-      logger.warn(`Retrying DB connection in ${backoffDelay / 1000}s... (Attempt ${retries} of ${MAX_RETRIES})`);
-      
-      // Resolve idle block logic for wait 
-      await new Promise(resolve => setTimeout(resolve, backoffDelay));
+      await new Promise(resolve => setTimeout(resolve, delay));
+      attempt++;
     }
   }
 };
 
-// Handle process termination loops dynamically directly gracefully killing pool tasks cleanly to prevent DB locks
-const closeDatabaseConnection = async () => {
+/**
+ * Graceful Shutdown Handler
+ * Closes the Sequelize connection pool cleanly when the process is terminated.
+ */
+const handleShutdown = async (signal) => {
+  logger.info(`Received ${signal}. Closing database connection pool...`);
   try {
     await sequelize.close();
-    logger.info('Database connection closed gracefully.');
+    logger.info('✅ Database pool closed gracefully.');
     process.exit(0);
   } catch (err) {
-    logger.error(`Error during database graceful shutdown: ${err.message}`);
+    logger.error('❌ Error during graceful shutdown:', err);
     process.exit(1);
   }
 };
 
-// Bind termination events targeting runtime shutdowns via Unix SIGINT/SIGTERM controls
-process.on('SIGINT', closeDatabaseConnection);
-process.on('SIGTERM', closeDatabaseConnection);
+// Listen for termination signals
+process.on('SIGTERM', () => handleShutdown('SIGTERM'));
+process.on('SIGINT', () => handleShutdown('SIGINT'));
 
 module.exports = {
   sequelize,
   testConnection,
-  connectWithRetry
+  connectWithRetry,
+  Sequelize 
 };
