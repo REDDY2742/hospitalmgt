@@ -28,6 +28,10 @@ const userRoutes = require('../modules/users/user.routes');
 const supplierRoutes = require('../modules/suppliers/supplier.routes');
 const roomRoutes = require('../modules/rooms/room.routes');
 const nurseRoutes = require('../modules/nurses/nurse.routes');
+const departmentRoutes = require('../modules/departments/department.routes');
+const appointmentRoutes = require('../modules/appointments/appointment.routes');
+const medicalRecordRoutes = require('../modules/medical-records/medicalRecord.routes');
+const insuranceRoutes = require('../modules/insurance/insurance.routes');
 
 router.get('/ping', (req, res) => {
   res.status(200).json({ message: 'API v1 is active' });
@@ -55,6 +59,10 @@ router.use('/users', userRoutes);
 router.use('/suppliers', supplierRoutes);
 router.use('/rooms', roomRoutes);
 router.use('/nurses', nurseRoutes);
+router.use('/departments', departmentRoutes);
+router.use('/appointments', appointmentRoutes);
+router.use('/medical-records', medicalRecordRoutes);
+router.use('/insurance', insuranceRoutes);
 
 // Add more module routes here as they are developed
 // router.use('/patients', patientRoutes);
