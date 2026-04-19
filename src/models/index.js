@@ -1,55 +1,64 @@
 const fs = require('fs');
 const path = require('path');
 const Sequelize = require('sequelize');
-const process = require('process');
+const dotenv = require('dotenv');
+const logger = require('../utils/logger.util');
+
+// Load environment variables
+dotenv.config();
+
 const basename = path.basename(__filename);
 const env = process.env.NODE_ENV || 'development';
-const logger = require('../utils/logger').createChildLogger('models-index');
-
-/** @type {Object.<string, Sequelize.ModelStatic<any>>} */
-const db = {};
 
 /**
- * Hospital Management System - Master Database Orchestrator
- * 
- * Features:
- * - Distributed Connection Pooling (min:5, max:20)
- * - Automatic Model Discovery (*.model.js)
- * - 5-Tier Exponential Backoff Retry Logic
- * - Singleton Pattern for Pool Integrity
- * - Graceful Shutdown Hooks for SIGTERM/SIGINT
- * - Comprehensive Clinical & Financial Associations
+ * @typedef {import('sequelize').Sequelize} SequelizeInstance
+ * @typedef {import('sequelize').ModelStatic<any>} Model
  */
 
+/**
+ * Database Singleton Container
+ * @type {{
+ *  sequelize: SequelizeInstance,
+ *  Sequelize: typeof Sequelize,
+ *  [key: string]: Model | any
+ * }}
+ */
+const db = {};
+
+// Connection Pool Configuration
 const dbConfig = {
-  host: process.env.DB_HOST || 'localhost',
+  host: process.env.DB_HOST || '127.0.0.1',
   port: process.env.DB_PORT || 3306,
   dialect: 'mysql',
-  logging: (msg) => env === 'development' ? logger.debug(msg) : false,
+  logging: (msg) => (env === 'development' ? logger.debug(`[Sequelize] ${msg}`) : false),
   pool: {
-    max: 20,
-    min: 5,
-    acquire: 30000,
-    idle: 10000
+    max: parseInt(process.env.DB_POOL_MAX) || 20,
+    min: parseInt(process.env.DB_POOL_MIN) || 5,
+    acquire: parseInt(process.env.DB_POOL_ACQUIRE) || 30000,
+    idle: parseInt(process.env.DB_POOL_IDLE) || 10000,
   },
   dialectOptions: {
     decimalNumbers: true,
-    timezone: '+05:30' // Standard Clinical Timezone
+    dateStrings: true,
+    typeCast: true,
   },
+  timezone: '+05:30', // Clinical Standard Timezone for India
   define: {
     timestamps: true,
     underscored: true,
-    freezeTableName: true
-  }
+    freezeTableName: true,
+  },
 };
 
 let sequelize;
 
 /**
- * Initializes the database connection with retry logic
- * @returns {Promise<Sequelize>}
+ * Initializes the Sequelize instance with exponential backoff retry logic.
+ * @param {number} maxRetries - Maximum number of connection attempts.
+ * @param {number} delay - Initial delay in milliseconds.
+ * @returns {Promise<SequelizeInstance>}
  */
-async function initializeDB(retries = 5, delay = 1000) {
+async function initializeSequelize(maxRetries = 5, delay = 1000) {
   if (sequelize) return sequelize;
 
   sequelize = new Sequelize(
@@ -59,26 +68,33 @@ async function initializeDB(retries = 5, delay = 1000) {
     dbConfig
   );
 
-  for (let i = 0; i < retries; i++) {
+  for (let i = 0; i < maxRetries; i++) {
     try {
       await sequelize.authenticate();
-      logger.info('MySQL Database Engine: Connected and Authenticated');
+      logger.info('MySQL Database successfully connected and authenticated.');
       return sequelize;
-    } catch (err) {
+    } catch (error) {
       const waitTime = delay * Math.pow(2, i);
-      logger.error(`Database Connection Failed. Retry ${i + 1}/${retries} in ${waitTime}ms: ${err.message}`);
-      if (i === retries - 1) throw err;
-      await new Promise(resolve => setTimeout(resolve, waitTime));
+      logger.error(`Database connection attempt ${i + 1}/${maxRetries} failed: ${error.message}`);
+      
+      if (i === maxRetries - 1) {
+        logger.error('CRITICAL: Database connection failed after maximum retries.');
+        throw error;
+      }
+      
+      await new Promise((resolve) => setTimeout(resolve, waitTime));
     }
   }
 }
 
-// Immediately invoke connection to start pooling
-initializeDB();
+// Start connection process immediately (it will run in background if not awaited)
+initializeSequelize().catch((err) => {
+  logger.error('Immediate DB Initialization failed:', err);
+});
 
-// 1. Dynamic Model Loading
+// 1. Dynamic Model Discovery & Loading
 fs.readdirSync(__dirname)
-  .filter(file => {
+  .filter((file) => {
     return (
       file.indexOf('.') !== 0 &&
       file !== basename &&
@@ -86,142 +102,178 @@ fs.readdirSync(__dirname)
       file.indexOf('.test.js') === -1
     );
   })
-  .forEach(file => {
+  .forEach((file) => {
     try {
+      // Each model should export a function: (sequelize, DataTypes) => Model
       const model = require(path.join(__dirname, file))(sequelize, Sequelize.DataTypes);
       db[model.name] = model;
-      logger.debug(`Model Loaded: ${model.name}`);
-    } catch (err) {
-      logger.error(`Dependency Error: Failed to load model from ${file} - ${err.message}`);
+      logger.info(`Model loaded successfully: ${model.name}`);
+    } catch (error) {
+      logger.error(`Failed to load model from file ${file}: ${error.message}`);
     }
   });
 
-// 2. Clinical & Financial Association Mapping
-Object.keys(db).forEach(modelName => {
-  if (db[modelName].associate) {
-    db[modelName].associate(db);
-  }
-});
-
-// Defining Explicit Core Associations
-const setupAssociations = (models) => {
+/**
+ * Setup Orchestrated Associations for the Hospital Management System
+ */
+const setupAssociations = () => {
   const {
-    User, Doctor, Staff, Nurse, Patient, 
-    Appointment, MedicalRecord, Bill, Prescription, LabTest, 
-    Emergency, Discharge, Ward, Room, Bed, Payment, 
-    InsuranceClaim, Medicine, PrescriptionItem, LabResult, 
-    BloodRequest, Dispatch, InventoryTransaction, PurchaseOrder, 
-    Notification, AuditLog, Department, Supplier, Ambulance, Pharmacy
-  } = models;
+    User, Doctor, Staff, Nurse, Patient,
+    Appointment, MedicalRecord, Billing, Prescription, LabTest,
+    Emergency, Discharge, Ward, Room, Bed, Payment,
+    Insurance, Pharmacy, Medicine, PrescriptionItem, LabResult,
+    BloodBank, BloodRequest, Ambulance, Dispatch,
+    Inventory, InventoryTransaction, Supplier, PurchaseOrder,
+    Notification, AuditLog, Department, OTSchedule, TelemedicineSession,
+    WardAssignment, PatientCareNote
+  } = db;
 
-  // --- Identity & Role Binding ---
+  // --- Identity & Access Management (Polymorphic Role Binding) ---
   if (User) {
-    User.hasOne(Doctor, { foreignKey: 'userId', as: 'doctorProfile' });
-    User.hasOne(Staff, { foreignKey: 'userId', as: 'staffProfile' });
-    User.hasOne(Nurse, { foreignKey: 'userId', as: 'nurseProfile' });
-    User.hasOne(Patient, { foreignKey: 'userId', as: 'patientProfile' });
-    User.hasMany(Notification, { foreignKey: 'userId' });
-    User.hasMany(AuditLog, { foreignKey: 'userId' });
+    if (Doctor) User.hasOne(Doctor, { foreignKey: 'userId', as: 'doctorProfile' });
+    if (Staff) User.hasOne(Staff, { foreignKey: 'userId', as: 'staffProfile' });
+    if (Nurse) User.hasOne(Nurse, { foreignKey: 'userId', as: 'nurseProfile' });
+    if (Patient) User.hasOne(Patient, { foreignKey: 'userId', as: 'patientProfile' });
+    if (Notification) User.hasMany(Notification, { foreignKey: 'userId' });
+    if (AuditLog) User.hasMany(AuditLog, { foreignKey: 'userId' });
   }
 
-  // --- Patient Medical Records ---
+  // --- Patient Records & Clinical History ---
   if (Patient) {
-    Patient.hasMany(Appointment, { foreignKey: 'patientId' });
-    Patient.hasMany(MedicalRecord, { foreignKey: 'patientId' });
-    Patient.hasMany(Bill, { foreignKey: 'patientId' });
-    Patient.hasMany(Prescription, { foreignKey: 'patientId' });
-    Patient.hasMany(LabTest, { foreignKey: 'patientId' });
-    Patient.hasMany(Emergency, { foreignKey: 'patientId' });
-    Patient.hasMany(Discharge, { foreignKey: 'patientId' });
+    if (Appointment) Patient.hasMany(Appointment, { foreignKey: 'patientId' });
+    if (MedicalRecord) Patient.hasMany(MedicalRecord, { foreignKey: 'patientId' });
+    if (Billing) Patient.hasMany(Billing, { foreignKey: 'patientId' });
+    if (Prescription) Patient.hasMany(Prescription, { foreignKey: 'patientId' });
+    if (LabTest) Patient.hasMany(LabTest, { foreignKey: 'patientId' });
+    if (Emergency) Patient.hasMany(Emergency, { foreignKey: 'patientId' });
+    if (Discharge) Patient.hasMany(Discharge, { foreignKey: 'patientId' });
   }
 
-  // --- Clinical Workflow ---
+  // --- Clinical Workspace & Workflow ---
   if (Doctor) {
-    Doctor.hasMany(Appointment, { foreignKey: 'doctorId' });
-    Doctor.hasMany(Prescription, { foreignKey: 'doctorId' });
-    Doctor.belongsTo(Department, { foreignKey: 'departmentId' });
+    if (Appointment) Doctor.hasMany(Appointment, { foreignKey: 'doctorId' });
+    if (Prescription) Doctor.hasMany(Prescription, { foreignKey: 'doctorId' });
+    if (OTSchedule) Doctor.hasMany(OTSchedule, { foreignKey: 'doctorId' });
+    if (TelemedicineSession) Doctor.hasMany(TelemedicineSession, { foreignKey: 'doctorId' });
+    if (Department) Doctor.belongsTo(Department, { foreignKey: 'departmentId' });
   }
 
+  // --- Nursing & Care Management ---
   if (Nurse) {
-    Nurse.hasMany(MedicalRecord, { foreignKey: 'nurseId' }); // as observer/caregiver
+    if (WardAssignment) Nurse.hasMany(WardAssignment, { foreignKey: 'nurseId' });
+    if (PatientCareNote) Nurse.hasMany(PatientCareNote, { foreignKey: 'nurseId' });
   }
 
-  // --- Ward Infrastructure ---
+  // --- Facility Management (Wards/Rooms/Beds) ---
   if (Ward) {
-    Ward.hasMany(Room, { foreignKey: 'wardId' });
-    Ward.hasMany(Bed, { foreignKey: 'wardId' });
+    if (Room) Ward.hasMany(Room, { foreignKey: 'wardId' });
+    if (Bed) Ward.hasMany(Bed, { foreignKey: 'wardId' });
   }
   if (Room) {
-    Room.hasMany(Bed, { foreignKey: 'roomId' });
-    Room.belongsTo(Ward, { foreignKey: 'wardId' });
+    if (Bed) Room.hasMany(Bed, { foreignKey: 'roomId' });
+    if (Ward) Room.belongsTo(Ward, { foreignKey: 'wardId' });
   }
   if (Bed) {
-    Bed.belongsTo(Room, { foreignKey: 'roomId' });
-    Bed.belongsTo(Ward, { foreignKey: 'wardId' });
+    if (Room) Bed.belongsTo(Room, { foreignKey: 'roomId' });
+    if (Ward) Bed.belongsTo(Ward, { foreignKey: 'wardId' });
   }
 
-  // --- Financial & Insurance ---
-  if (Bill) {
-    Bill.hasMany(Payment, { foreignKey: 'billId' });
-    Bill.hasOne(InsuranceClaim, { foreignKey: 'billId' });
+  // --- Financial Ecosystem ---
+  if (Billing) {
+    if (Payment) Billing.hasMany(Payment, { foreignKey: 'billingId' });
+    if (Insurance) Billing.hasOne(Insurance, { foreignKey: 'billingId', as: 'insuranceClaim' });
   }
 
-  // --- Laboratory & Pharmacy ---
-  if (LabTest) {
-    LabTest.hasMany(LabResult, { foreignKey: 'labTestId' });
+  // --- Pharmacy & Medication Logistics ---
+  if (Pharmacy) {
+    if (Medicine) Pharmacy.hasMany(Medicine, { foreignKey: 'pharmacyId' });
   }
   if (Prescription) {
-    Prescription.hasMany(PrescriptionItem, { foreignKey: 'prescriptionId' });
+    if (PrescriptionItem) Prescription.hasMany(PrescriptionItem, { foreignKey: 'prescriptionId' });
   }
-  if (PrescriptionItem) {
+  if (PrescriptionItem && Medicine) {
     PrescriptionItem.belongsTo(Medicine, { foreignKey: 'medicineId' });
   }
 
-  // --- Logistics & Inventory ---
+  // --- Laboratory & Diagnostic Services ---
+  if (LabTest) {
+    if (LabResult) LabTest.hasMany(LabResult, { foreignKey: 'labTestId' });
+  }
+
+  // --- Blood Bank Operations ---
+  if (BloodBank) {
+    if (BloodRequest) BloodBank.hasMany(BloodRequest, { foreignKey: 'bloodBankId' });
+  }
+
+  // --- Logistics & Emergency Services ---
   if (Ambulance) {
-    Ambulance.hasMany(Dispatch, { foreignKey: 'ambulanceId' });
+    if (Dispatch) Ambulance.hasMany(Dispatch, { foreignKey: 'ambulanceId' });
+  }
+
+  // --- Inventory & Procurement ---
+  if (Inventory) {
+    if (InventoryTransaction) Inventory.hasMany(InventoryTransaction, { foreignKey: 'inventoryId' });
   }
   if (Supplier) {
-    Supplier.hasMany(PurchaseOrder, { foreignKey: 'supplierId' });
+    if (PurchaseOrder) Supplier.hasMany(PurchaseOrder, { foreignKey: 'supplierId' });
   }
+
+  // --- Cross-Cutting Concerns ---
+  if (Notification) Notification.belongsTo(User, { foreignKey: 'userId' });
+  if (AuditLog) AuditLog.belongsTo(User, { foreignKey: 'userId' });
+
+  // Call separate associate methods if defined in models
+  Object.keys(db).forEach((modelName) => {
+    if (db[modelName].associate) {
+      db[modelName].associate(db);
+    }
+  });
 };
 
-// Check if models exist before running association setup
-if (Object.keys(db).length > 0) {
-  setupAssociations(db);
-}
+// Initialize associations
+setupAssociations();
 
 /**
- * Performs a deep health check of the connection pool
- * @returns {Promise<Object>}
+ * Connection Health Check
+ * @returns {Promise<{status: string, message?: string, timestamp: string}>}
  */
 const checkHealth = async () => {
   try {
     await sequelize.authenticate();
-    const [result] = await sequelize.query('SELECT 1 as alive');
-    return { status: 'UP', engine: 'MySQL', latency: 'Stable', result };
-  } catch (err) {
-    return { status: 'DOWN', error: err.message };
+    return {
+      status: 'UP',
+      timestamp: new Date().toISOString(),
+      database: 'Connected'
+    };
+  } catch (error) {
+    return {
+      status: 'DOWN',
+      timestamp: new Date().toISOString(),
+      message: error.message
+    };
   }
 };
 
 /**
- * Graceful Engine Terminations
+ * Graceful Closure of Database Connections
  */
-const gracefulShutdown = async () => {
+const handleGracefulShutdown = async () => {
   if (sequelize) {
-    logger.info('MySQL Engine: Releasing connection pool and shutting down...');
-    await sequelize.close();
-    logger.info('MySQL Engine: Successfully terminated');
+    try {
+      logger.info('Closing database connection pool...');
+      await sequelize.close();
+      logger.info('Database connection pool closed successfully.');
+    } catch (err) {
+      logger.error(`Error during database shutdown: ${err.message}`);
+    }
   }
 };
 
-process.on('SIGTERM', gracefulShutdown);
-process.on('SIGINT', gracefulShutdown);
+process.on('SIGTERM', handleGracefulShutdown);
+process.on('SIGINT', handleGracefulShutdown);
 
 db.sequelize = sequelize;
 db.Sequelize = Sequelize;
 db.checkHealth = checkHealth;
-db.initializeDB = initializeDB;
 
 module.exports = db;
