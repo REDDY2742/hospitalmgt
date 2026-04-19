@@ -1,102 +1,276 @@
 const winston = require('winston');
-require('winston-daily-rotate-file');
-const { createLogger, format, transports } = winston;
+const DailyRotateFile = require('winston-daily-rotate-file');
+const morgan = require('morgan');
+const os = require('os');
+const path = require('path');
+const { AsyncLocalStorage } = require('async_hooks');
 
 /**
- * Hospital Observability & Structured Logging Utility
+ * Hospital Management System - Enterprise Observability Engine
  * 
- * Implements context-aware logging with HIPAA-compliant PII masking 
- * and dedicated audit/security transport streams.
+ * Provides production-grade structured logging with HIPAA-compliant masking, 
+ * long-term security auditing, and performance telemetry.
+ * Features: Multi-transport rotation, request tracing, and PII sanitization.
  */
 
-const SHIELDED_FIELDS = [
-  'password', 'token', 'refreshToken', 'otp', 'aadhaarNumber', 
-  'cardNumber', 'cvv', 'pin', 'secretKey', 'privateKey', 
-  'accountNumber', 'panNumber', 'email'
-];
+// --- Request Context Storage ---
+const asyncStorage = new AsyncLocalStorage();
 
-/**
- * @description Deep-scans and masks sensitive keys in log payloads
- */
-const maskData = (obj) => {
-  if (!obj || typeof obj !== 'object') return obj;
-  const masked = Array.isArray(obj) ? [] : {};
-  
-  for (const key in obj) {
-    if (SHIELDED_FIELDS.includes(key)) {
-      masked[key] = '***REDACTED***';
-    } else if (typeof obj[key] === 'object') {
-      masked[key] = maskData(obj[key]);
-    } else {
-      masked[key] = obj[key];
-    }
-  }
-  return masked;
+// --- Log Levels & Colors ---
+const levels = {
+  fatal: 0,
+  error: 1,
+  warn: 2,
+  security: 3,
+  audit: 4,
+  info: 5,
+  http: 6,
+  debug: 7
 };
 
-const maskFormat = format((info) => {
-  const meta = info[Symbol.for('splat')]?.[0];
-  if (meta) info[Symbol.for('splat')][0] = maskData(meta);
-  if (info.meta) info.meta = maskData(info.meta);
-  return info;
-});
+const colors = {
+  fatal: 'magenta bold',
+  error: 'red',
+  warn: 'yellow',
+  security: 'red bold',
+  audit: 'cyan',
+  info: 'green',
+  http: 'blue',
+  debug: 'white'
+};
 
-const logger = createLogger({
-  levels: {
-    error: 0,
-    warn: 1,
-    audit: 2, // Custom level for regulatory compliance
-    info: 3,
-    debug: 4
-  },
-  format: format.combine(
-    format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
-    maskFormat(),
-    format.json()
-  ),
-  transports: [
-    new transports.Console({
-      format: format.combine(format.colorize(), format.simple()),
-      level: process.env.NODE_ENV === 'production' ? 'info' : 'debug'
+winston.addColors(colors);
+
+// --- PII & Sensitive Data Sanitization ---
+
+const SENSITIVE_FIELDS = ['password', 'aadhaar', 'pan', 'card', 'cvv', 'otp', 'secret', 'token'];
+
+const sanitize = (info) => {
+  const result = { ...info };
+  const mask = (val) => (typeof val === 'string' ? `${val.slice(0, 4)}****` : '****');
+
+  const recursiveMask = (obj) => {
+    for (let key in obj) {
+      if (typeof obj[key] === 'object' && obj[key] !== null) {
+        recursiveMask(obj[key]);
+      } else if (SENSITIVE_FIELDS.some(field => key.toLowerCase().includes(field))) {
+        obj[key] = mask(obj[key]);
+      }
+    }
+  };
+
+  recursiveMask(result);
+  return result;
+};
+
+const sanitizeFormat = winston.format(info => sanitize(info));
+
+// --- Format Definitions ---
+
+const jsonFormat = winston.format.combine(
+  winston.format.timestamp(),
+  sanitizeFormat(),
+  winston.format.json()
+);
+
+const consoleFormat = winston.format.combine(
+  winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss:ms' }),
+  winston.format.colorize({ all: true }),
+  winston.format.printf(info => {
+    const context = asyncStorage.getStore() || {};
+    const reqInfo = context.requestId ? `[${context.requestId}] ` : '';
+    return `${info.timestamp} ${info.level}: ${reqInfo}${info.message} ${info.module ? `(${info.module})` : ''}`;
+  })
+);
+
+// --- Transports Setup ---
+
+const createTransports = () => {
+  const isProd = process.env.NODE_ENV === 'production';
+  const logDir = 'logs';
+
+  const transports = [
+    new winston.transports.Console({
+      format: isProd ? jsonFormat : consoleFormat,
+      level: isProd ? 'info' : 'debug'
     }),
-    new transports.DailyRotateFile({
-      filename: 'logs/combined-%DATE%.log',
+    new DailyRotateFile({
+      filename: path.join(logDir, 'application-%DATE%.log'),
       datePattern: 'YYYY-MM-DD',
-      maxFiles: '30d',
-      zippedArchive: true,
+      maxSize: '20m',
+      maxFiles: '14d',
       level: 'info'
     }),
-    new transports.DailyRotateFile({
-      filename: 'logs/error-%DATE%.log',
+    new DailyRotateFile({
+      filename: path.join(logDir, 'error-%DATE%.log'),
       datePattern: 'YYYY-MM-DD',
-      maxFiles: '90d',
-      zippedArchive: true,
+      maxSize: '20m',
+      maxFiles: '30d',
       level: 'error'
     }),
-    new transports.DailyRotateFile({
-      filename: 'logs/audit-%DATE%.log',
+    // Compliance: Long term audit & security logs
+    new DailyRotateFile({
+      filename: path.join(logDir, 'security-%DATE%.log'),
       datePattern: 'YYYY-MM-DD',
       maxFiles: '365d',
-      zippedArchive: true,
+      level: 'security'
+    }),
+    new DailyRotateFile({
+      filename: path.join(logDir, 'audit-%DATE%.log'),
+      datePattern: 'YYYY-MM-DD',
+      maxFiles: '2555d', // 7 years retention
       level: 'audit'
     })
-  ]
+  ];
+
+  return transports;
+};
+
+// --- Logger Instance ---
+
+const logger = winston.createLogger({
+  levels,
+  defaultMeta: {
+    service: 'hospital-management-system',
+    hostname: os.hostname(),
+    env: process.env.NODE_ENV || 'development'
+  },
+  transports: createTransports(),
+  exitOnError: false
 });
 
-module.exports = logger;
+// --- Performance & Tracing Methods ---
 
-module.exports.logAudit = (action, userId, module, resourceId, meta) => {
-  logger.log('audit', `${action} by ${userId} on ${module}:${resourceId}`, { meta });
+/**
+ * @description Creates a child logger with fixed module metadata
+ */
+logger.createChildLogger = (moduleName) => {
+  return logger.child({ module: moduleName });
 };
 
-module.exports.logSecurity = (event, userId, ip, details) => {
-  logger.warn(`SECURITY_EVENT: ${event} | User: ${userId} | IP: ${ip}`, { details });
+/**
+ * @description Starts a performance timer
+ */
+logger.createTimer = (label) => {
+  const start = Date.now();
+  return (meta = {}) => {
+    const duration = Date.now() - start;
+    logger.info(`PERFORMANCE: ${label}`, { ...meta, duration, threshold: meta.threshold || 500 });
+    if (duration > (meta.threshold || 500)) {
+      logger.warn(`SLOW_OPERATION: ${label} took ${duration}ms`, { ...meta, duration });
+    }
+  };
 };
 
-module.exports.logPerformance = (operation, durationMs, meta) => {
-  logger.info(`PERF: ${operation} completed in ${durationMs}ms`, { meta });
+// --- Morgan HTTP Integration ---
+
+const morganMiddleware = morgan((tokens, req, res) => {
+  const context = asyncStorage.getStore() || {};
+  const message = [
+    tokens.method(req, res),
+    tokens.url(req, res),
+    tokens.status(req, res),
+    tokens['response-time'](req, res), 'ms'
+  ].join(' ');
+
+  logger.http(message, {
+    requestId: context.requestId,
+    ip: req.ip,
+    userAgent: req.headers['user-agent']
+  });
+
+  return null; // Don't write to standard morgan stream
+});
+
+// --- Lifecycle & Middlewares ---
+
+/**
+ * @description Middleware to initialize request context using AsyncLocalStorage
+ */
+const requestContextMiddleware = (req, res, next) => {
+  const context = {
+    requestId: req.headers['x-request-id'] || `req-${Date.now()}`,
+    userId: req.user?.id,
+    startTime: Date.now()
+  };
+  asyncStorage.run(context, next);
 };
 
-module.exports.createChildLogger = (moduleName) => {
-  return logger.child({ label: moduleName });
+// --- Specialized Forensic Handlers ---
+
+const maskIP = (ip) => {
+  if (process.env.NODE_ENV !== 'production') return ip;
+  if (!ip) return '0.0.0.0';
+  return ip.replace(/\d+$/, 'XXX'); // Mask last octet
+};
+
+/**
+ * @description Capture application exceptions with context and optional Sentry/External sink
+ */
+const captureException = (error, context = {}) => {
+  const isOperational = error.isOperational || false;
+  logger.error(error.message, {
+    stack: process.env.NODE_ENV !== 'production' ? error.stack : undefined,
+    code: error.code,
+    isOperational,
+    ...context
+  });
+  
+  if (!isOperational) {
+    // Logic: Trigger infra alert if non-operational (system failure)
+  }
+};
+
+/**
+ * @description Immutable audit log generator for HIPAA compliance
+ */
+const audit = (userId, action, entity = {}, changes = {}) => {
+  logger.log('audit', `${action} by ${userId}`, {
+    userId,
+    action,
+    entityType: entity.type,
+    entityId: entity.id,
+    changes,
+    timestamp: new Date().toISOString()
+  });
+};
+
+/**
+ * @description Performance tracking for database queries
+ */
+const trackDatabaseQuery = async (queryFn, model, operation) => {
+  const timer = logger.createTimer(`DB_QUERY:${model}/${operation}`);
+  try {
+    const result = await queryFn();
+    timer();
+    return result;
+  } catch (err) {
+    timer({ status: 'error' });
+    throw err;
+  }
+};
+
+/**
+ * @description Safe logger termination (flushes buffers before shutdown)
+ */
+const shutdownLogger = async () => {
+  return new Promise((resolve) => {
+    logger.on('finish', resolve);
+    logger.end();
+  });
+};
+
+module.exports = {
+  logger,
+  requestContextMiddleware,
+  morganMiddleware,
+  createChildLogger: logger.createChildLogger,
+  createTimer: logger.createTimer,
+  captureException,
+  audit,
+  trackDatabaseQuery,
+  shutdownLogger,
+  maskIP,
+  fatal: (msg, meta) => logger.log('fatal', msg, meta),
+  security: (msg, meta) => logger.log('security', msg, meta)
 };

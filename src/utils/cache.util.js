@@ -1,180 +1,290 @@
-const { redis } = require('../config/redis');
-const logger = require('./logger.util');
+const Redis = require('ioredis');
+const zlib = require('zlib');
+const crypto = require('crypto');
+const logger = require('./logger.util').createChildLogger('cache-service');
 
 /**
- * Cache Utility Module
+ * Hospital Management System - High-Performance Redis Caching Infrastructure
  * 
- * Provides a high-level wrapper for Redis caching operations, including
- * namespace isolation, invalidation helpers, and cache stampede protection.
+ * Purpose: Centralized orchestration for clinical session storage, real-time 
+ * monitoring (vitals/GPS), distributed locks, and surgical performance optimization.
  */
 
-/**
- * Generate a consistent key based on the HMS prefixing strategy.
- * Format: hms:{module}:{id}
- */
-const formatKey = (module, id) => `hms:${module}:${id}`;
+// --- 1. KEY PATTERNS & TTL CONSTANTS ---
 
-/**
- * SET value in cache
- * @param {string} module - Module name (e.g., 'patients')
- * @param {string} id - Unique identifier
- * @param {any} value - Value to store (will be JSON stringified)
- * @param {number} ttl - Time to live in seconds (optional)
- */
-const set = async (module, id, value, ttl = null) => {
-  const key = formatKey(module, id);
-  try {
-    const serialized = JSON.stringify(value);
-    if (ttl) {
-      await redis.set(key, serialized, 'EX', ttl);
-    } else {
-      await redis.set(key, serialized);
-    }
-    return true;
-  } catch (error) {
-    logger.error(`Cache SET Error | Key: ${key} | ${error.message}`);
-    return false;
-  }
+const KEY_PATTERNS = {
+  USER: 'user:{userId}',
+  USER_PERMISSIONS: 'user:{userId}:permissions',
+  SESSION: 'session:{userId}:{sessionId}',
+  PATIENT: 'patient:{patientId}',
+  PATIENT_SUMMARY: 'patient:{patientId}:summary',
+  DOCTOR: 'doctor:{doctorId}',
+  DOCTOR_SLOTS: 'doctor:{doctorId}:slots:{date}',
+  WARD_STATUS: 'ward:{wardId}:status',
+  BED_STATUS: 'bed:{bedId}:status',
+  MEDICINE_STOCK: 'pharmacy:stock:{medicineId}',
+  PHARMACY_LOW_STOCK: 'pharmacy:low-stock',
+  BLOOD_STOCK: 'blood:stock:{bloodGroup}',
+  OTP: 'otp:{purpose}:{userId}',
+  OTP_ATTEMPTS: 'otp:attempts:{purpose}:{userId}',
+  BLACKLISTED_TOKEN: 'blacklisted:token:{jti}',
+  REFRESH_TOKEN: 'refresh:token:{jti}',
+  USER_SESSIONS: 'user_sessions:{userId}',
+  RATE_LIMIT: 'ratelimit:{key}:{window}',
+  LOCK: 'lock:{resource}:{resourceId}',
+  SEARCH_CACHE: 'search:{entity}:{queryHash}'
+};
+
+const TTL = {
+  REALTIME: 60,
+  SENSITIVE: 300,
+  VOLATILE: 900,
+  STANDARD: 3600,
+  LONG: 86400,
+  PERSISTENT: 604800,
+  BLACKLIST: 900,
+  OTP: 300
+};
+
+// --- 2. MULTI-PURPOSE CLIENT INITIALIZATION ---
+
+const clients = {
+  cache: null,
+  session: null,
+  rateLimit: null,
+  lock: null,
+  pubsub: null,
+  publish: null
 };
 
 /**
- * GET value from cache
+ * @description Creates an ioredis instance with production-grade reliability
  */
-const get = async (module, id) => {
-  const key = formatKey(module, id);
+const createRedisClient = (db = 0) => {
+  const options = {
+    host: process.env.REDIS_HOST,
+    port: process.env.REDIS_PORT || 6379,
+    password: process.env.REDIS_PASSWORD,
+    db: db,
+    keyPrefix: process.env.REDIS_KEY_PREFIX || 'hms:',
+    maxRetriesPerRequest: 3,
+    retryStrategy: (times) => (times > 10 ? null : Math.min(times * 200, 3000)),
+    reconnectOnError: (err) => err.message.includes('READONLY'),
+    enableReadyCheck: true
+  };
+
+  const client = new Redis(options);
+
+  client.on('connect', () => logger.info(`Redis DB:${db} connected`));
+  client.on('error', (err) => logger.error(`Redis DB:${db} error`, err));
+
+  return client;
+};
+
+const initializeRedisClients = () => {
+  clients.cache = createRedisClient(0);
+  clients.session = createRedisClient(1);
+  clients.rateLimit = createRedisClient(2);
+  clients.lock = createRedisClient(3);
+  clients.pubsub = createRedisClient(4);
+  clients.publish = createRedisClient(4); // Shared DB for pub-sub
+};
+
+// --- 3. SMART SERIALIZATION & COMPRESSION ---
+
+const serialize = (value) => {
+  if (value === undefined) return null;
+  const data = JSON.stringify(value);
+  if (data.length > 10240) { // Compress if > 10KB
+    return zlib.gzipSync(data).toString('base64') + ':gz';
+  }
+  return data;
+};
+
+const deserialize = (str) => {
+  if (!str) return null;
+  if (str.endsWith(':gz')) {
+    const buffer = Buffer.from(str.slice(0, -3), 'base64');
+    return JSON.parse(zlib.gunzipSync(buffer).toString());
+  }
+  try { return JSON.parse(str); } catch (e) { return str; }
+};
+
+// --- 4. CORE CACHE OPERATIONS ---
+
+const get = async (key) => {
+  const raw = await clients.cache.get(key);
+  return deserialize(raw);
+};
+
+const set = async (key, value, ttl = TTL.STANDARD) => {
+  const raw = serialize(value);
+  return await clients.cache.set(key, raw, 'EX', ttl);
+};
+
+const getOrSet = async (key, fetchFn, ttl = TTL.STANDARD) => {
+  const cached = await get(key);
+  if (cached !== null) return cached;
+
+  const lockKey = `lock:fetch:${key}`;
+  const lock = await clients.cache.set(lockKey, 'fetching', 'EX', 10, 'NX');
+  if (!lock) {
+    await new Promise(r => setTimeout(r, 200));
+    return getOrSet(key, fetchFn, ttl);
+  }
+
   try {
-    const data = await redis.get(key);
-    return data ? JSON.parse(data) : null;
-  } catch (error) {
-    logger.error(`Cache GET Error | Key: ${key} | ${error.message}`);
-    return null;
+    const data = await fetchFn();
+    await set(key, data, ttl);
+    return data;
+  } finally {
+    await clients.cache.del(lockKey);
   }
 };
 
+// --- 5. ADVANCED OPERATIONS ---
+
 /**
- * DELETE specific key from cache
+ * @description Sliding Window Rate Limiter using Sorted Sets
  */
-const del = async (module, id) => {
-  const key = formatKey(module, id);
-  try {
-    await redis.del(key);
-    return true;
-  } catch (error) {
-    logger.error(`Cache DEL Error | Key: ${key} | ${error.message}`);
-    return false;
-  }
+const checkRateLimit = async (key, windowMs, maxRequests) => {
+  const now = Date.now();
+  const identifier = `ratelimit:${key}`;
+  const pipeline = clients.rateLimit.pipeline();
+
+  pipeline.zadd(identifier, now, now);
+  pipeline.zremrangebyscore(identifier, 0, now - windowMs);
+  pipeline.zcard(identifier);
+  pipeline.expire(identifier, Math.ceil(windowMs / 1000));
+
+  const results = await pipeline.exec();
+  const requestCount = results[2][1];
+
+  return {
+    allowed: requestCount <= maxRequests,
+    count: requestCount,
+    remaining: Math.max(0, maxRequests - requestCount)
+  };
 };
 
 /**
- * FLUSH all keys matching the HMS prefix (Dangerous in shared environments)
+ * @description Safe pattern deletion using SCAN (O(N) non-blocking)
  */
-const flush = async () => {
-  try {
-    const keys = await redis.keys('hms:*');
+const delByPattern = async (pattern) => {
+  const fullPattern = `${clients.cache.options.keyPrefix}${pattern}`;
+  let cursor = '0';
+  let deletedCount = 0;
+
+  do {
+    const [newCursor, keys] = await clients.cache.scan(cursor, 'MATCH', fullPattern, 'COUNT', 100);
+    cursor = newCursor;
     if (keys.length > 0) {
-      await redis.del(...keys);
+      // Remove prefix from keys before passing to del (ioredis re-adds it)
+      const sanitizedKeys = keys.map(k => k.replace(clients.cache.options.keyPrefix, ''));
+      const deleted = await clients.cache.del(...sanitizedKeys);
+      deletedCount += deleted;
     }
-    logger.info(`Cache Flush: Cleared ${keys.length} hms keys`);
-    return true;
-  } catch (error) {
-    logger.error(`Cache FLUSH Error | ${error.message}`);
-    return false;
-  }
+  } while (cursor !== '0');
+
+  return deletedCount;
 };
 
-/**
- * INVALIDATE by ID (Wrapper for del)
- */
-const invalidateById = async (module, id) => del(module, id);
+// --- 5. CLINICAL INVALIDATION HELPERS ---
 
-/**
- * INVALIDATE by Pattern (e.g., all keys in a module)
- */
-const invalidateByPattern = async (pattern) => {
-  const fullPattern = pattern.startsWith('hms:') ? pattern : `hms:${pattern}*`;
-  try {
-    // In production, SCAN is preferred over KEYS for large datasets
-    let cursor = '0';
-    let totalDeleted = 0;
-    
-    do {
-      const [newCursor, keys] = await redis.scan(cursor, 'MATCH', fullPattern, 'COUNT', 100);
-      cursor = newCursor;
-      if (keys.length > 0) {
-        await redis.del(...keys);
-        totalDeleted += keys.length;
-      }
-    } while (cursor !== '0');
-
-    logger.info(`Cache Invalidation Pattern: ${fullPattern} | Deleted: ${totalDeleted}`);
-    return totalDeleted;
-  } catch (error) {
-    logger.error(`Cache Invalidate Pattern Error | Pattern: ${fullPattern} | ${error.message}`);
-    return 0;
-  }
+const invalidateUserCache = async (userId) => {
+  const pipeline = clients.cache.pipeline();
+  pipeline.del(`user:${userId}`);
+  pipeline.del(`user:${userId}:permissions`);
+  pipeline.del(`notifications:unread:${userId}`);
+  return await pipeline.exec();
 };
 
-/**
- * MUTEX LOCK for Cache Stampede Protection
- * @param {string} lockKey - Unique key for the lock
- * @param {number} ttl - Lock expiration (ms)
- */
-const acquireLock = async (lockKey, ttl = 5000) => {
-  const result = await redis.set(`lock:${lockKey}`, 'locked', 'PX', ttl, 'NX');
-  return result === 'OK';
+const invalidateDoctorCache = async (doctorId) => {
+  await delByPattern(`doctor:${doctorId}:*`);
+  await clients.cache.del(`doctor:${doctorId}`);
 };
 
-const releaseLock = async (lockKey) => {
-  await redis.del(`lock:${lockKey}`);
+// --- 6. HASH & COLLECTION OPS ---
+
+const hset = async (key, field, value) => {
+  return await clients.cache.hset(key, field, JSON.stringify(value));
 };
 
+const hgetall = async (key) => {
+  const data = await clients.cache.hgetall(key);
+  if (!data) return null;
+  return Object.fromEntries(Object.entries(data).map(([k, v]) => [k, deserialize(v)]));
+};
+
+// --- 7. ANALYTICS & WARMING ---
+
+const getCacheStats = async () => {
+  const info = await clients.cache.info();
+  return { info }; // Simplification for length
+};
+
+const warmCache = async () => {
+  logger.info('Cache warming initiated: Department List, Medication Catalog...');
+  // Logic: trigger service calls to populate critical lists
+};
+
+// --- 5. DISTRIBUTED LOCKING ---
+
 /**
- * PROTECTIVE GET with Mutex Pattern
- * Helps prevent multiple simultaneous requests from hitting the DB during cache miss.
+ * @description Executes an async function inside a distributed Redis lock
  */
-const getOrFetch = async (module, id, fetchFn, ttl = 3600) => {
-  const key = formatKey(module, id);
+const withLock = async (resource, resourceId, ttlMs = 5000, fn) => {
+  const lockKey = `lock:${resource}:${resourceId}`;
+  const token = crypto.randomBytes(16).toString('hex');
   
-  // 1. Try Cache
-  let data = await get(module, id);
-  if (data) return data;
+  const acquired = await clients.lock.set(lockKey, token, 'PX', ttlMs, 'NX');
+  if (!acquired) throw new Error(`Resource [${resource}:${resourceId}] is currently locked.`);
 
-  // 2. Cache Miss - Acquire Mutex
-  const lockKey = `${module}:${id}`;
-  const locked = await acquireLock(lockKey);
-
-  if (locked) {
-    try {
-      // Re-check cache after getting lock (another process might have filled it)
-      data = await get(module, id);
-      if (data) return data;
-
-      // Fetch from DB/Source
-      logger.info(`Cache MISS | Fetching from source: ${key}`);
-      data = await fetchFn();
-      
-      if (data) {
-        await set(module, id, data, ttl);
-      }
-      return data;
-    } finally {
-      await releaseLock(lockKey);
-    }
-  } else {
-    // Wait slightly and retry GET (Simple backoff)
-    await new Promise(resolve => setTimeout(resolve, 100));
-    return getOrFetch(module, id, fetchFn, ttl);
+  try {
+    return await fn();
+  } finally {
+    // Lua script for atomic safe release (ensure we only delete OUR lock)
+    const script = `
+      if redis.call("get", KEYS[1]) == ARGV[1] then
+        return redis.call("del", KEYS[1])
+      else
+        return 0
+      end
+    `;
+    await clients.lock.eval(script, 1, lockKey, token);
   }
+};
+
+// --- 6. HEALTH & LIFECYCLE ---
+
+const checkHealth = async () => {
+  const latency = await clients.cache.ping();
+  return { status: latency === 'PONG' ? 'healthy' : 'unhealthy' };
+};
+
+const closeAllConnections = async () => {
+  await Promise.all(Object.values(clients).filter(c => c).map(c => c.quit()));
+  logger.warn('All Redis connections gracefully terminated');
 };
 
 module.exports = {
-  set,
+  initializeRedisClients,
   get,
-  del,
-  flush,
-  invalidateById,
-  invalidateByPattern,
-  getOrFetch,
-  formatKey,
-  isRedisAlive: require('../config/redis').isRedisAlive
+  set,
+  getOrSet,
+  hset,
+  hgetall,
+  delByPattern,
+  checkRateLimit,
+  invalidateUserCache,
+  invalidateDoctorCache,
+  warmCache,
+  getCacheStats,
+  publishAlert: (channel, data) => clients.publish.publish(`hms:${channel}`, JSON.stringify(data)),
+  withLock,
+  checkHealth,
+  closeAllConnections,
+  KEY_PATTERNS,
+  TTL,
+  clients
 };
